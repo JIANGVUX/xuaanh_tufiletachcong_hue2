@@ -3,7 +3,6 @@ import html
 import os
 import re
 import zipfile
-import tempfile
 from datetime import datetime, date, time
 from io import BytesIO
 from pathlib import Path
@@ -20,15 +19,9 @@ st.title("Xuất bảng công cho từng nhân viên - by Jiangvux")
 # Cache Chromium của pyppeteer vào HOME để ổn định trên Streamlit Cloud
 os.environ.setdefault("PYPPETEER_HOME", str(Path.home() / ".cache" / "pyppeteer"))
 
-# =========================
-# DEFAULT TEXT
-# =========================
-DEFAULT_WATERMARK = "Liên hệ Nguyễn Huệ Hr ( 0356 227 868 ) - timvieclam.9phut.com"
+WATERMARK = "Liên hệ Nguyễn Huệ Hr ( 0356 227 868 ) - timvieclam.9phut.com"
 
-# =========================
-# CSS TEMPLATE (dynamic parts injected in build_html)
-# =========================
-CSS_BASE = r"""
+CSS = r"""
 :root{
   --bg:#ffffff;
   --bar:#3a3a3a;
@@ -229,26 +222,7 @@ def is_col_130(h: str) -> bool:
     s = (h or "").lower()
     return ("lương giờ 130%" in s) or ("luong gio 130%" in s) or ("lương giờ ca đêm" in s) or ("luong gio ca dem" in s) or ("ca đêm" in s) or ("ca dem" in s) or ("tc 130" in s) or ("tăng ca 130" in s)
 
-def normalize_header(x) -> str:
-    return str(x).strip() if x is not None else ""
-
-def unique_preserve_order(items):
-    seen = set()
-    out = []
-    for it in items:
-        if it not in seen:
-            seen.add(it)
-            out.append(it)
-    return out
-
-def build_html(sheet_name: str, headers: list, rows: list, *,
-              show_stamp: bool, stamp_text: str,
-              show_watermark: bool, watermark_text: str) -> str:
-    """
-    Build HTML với:
-    - Stamp (góc dưới trái) bật/tắt
-    - Watermark (giữa dưới) bật/tắt
-    """
+def build_html(sheet_name: str, headers: list, rows: list, stamp_text: str) -> str:
     ths = "".join(f"<th>{html.escape(str(h) if h is not None else '')}</th>" for h in headers)
 
     trs = []
@@ -267,23 +241,12 @@ def build_html(sheet_name: str, headers: list, rows: list, *,
             tds.append(f"<td{class_attr}>{c['value_html']}</td>")
         trs.append(f'<tr class="{tr_cls}">{"".join(tds)}</tr>')
 
-    footer_html = ""
-    if show_stamp or show_watermark:
-        stamp_div = f'<div class="stamp">{html.escape(stamp_text)}</div>' if show_stamp else ""
-        watermark_div = f'<div class="footer">{html.escape(watermark_text)}</div>' if show_watermark else ""
-        footer_html = f"""
-        <div class="footer-area">
-          {stamp_div}
-          {watermark_div}
-        </div>
-        """
-
     return f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<style>{CSS_BASE}</style>
+<style>{CSS}</style>
 </head>
 <body>
   <div class="wrap">
@@ -294,33 +257,33 @@ def build_html(sheet_name: str, headers: list, rows: list, *,
         {''.join(trs)}
       </tbody>
     </table>
-    {footer_html}
+    <div class="footer-area">
+      <div class="stamp">{html.escape(stamp_text)}</div>
+      <div class="footer">{html.escape(WATERMARK)}</div>
+    </div>
   </div>
 </body>
 </html>
 """
 
-# =========================
-# ASYNC UTILS
-# =========================
-def run_async(coro):
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(coro)
-    finally:
-        try:
-            loop.close()
-        except:
-            pass
+def normalize_header(x) -> str:
+    return str(x).strip() if x is not None else ""
+
+def unique_preserve_order(items):
+    seen = set()
+    out = []
+    for it in items:
+        if it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
 
 # =========================
 # PYPPETEER RENDER (write straight to ZIP + return count)
 # =========================
-async def render_html_list_to_zip(html_list, zip_file, *, scale: float = 2.0, progress_cb=None):
+async def render_html_list_to_zip(html_list, zip_file, progress_cb=None):
     """
     Render lần lượt từng HTML -> PNG và ghi trực tiếp vào zip_file.
-    - scale: deviceScaleFactor (1.0 ~ 3.0). Càng cao càng nét (nhưng nặng hơn).
     Return: số file đã ghi vào ZIP.
     """
     from pyppeteer import launch
@@ -343,7 +306,7 @@ async def render_html_list_to_zip(html_list, zip_file, *, scale: float = 2.0, pr
     exported = 0
     try:
         page = await browser.newPage()
-        await page.setViewport({"width": 1200, "height": 900, "deviceScaleFactor": float(scale)})
+        await page.setViewport({"width": 1200, "height": 900})
 
         total = len(html_list)
         for i, (fname, html_str) in enumerate(html_list, start=1):
@@ -351,8 +314,6 @@ async def render_html_list_to_zip(html_list, zip_file, *, scale: float = 2.0, pr
                 progress_cb(i - 1, total, fname)
 
             await page.setContent(html_str)
-
-            # chờ layout ổn định một chút
             try:
                 await page.waitFor(80)
             except:
@@ -360,10 +321,12 @@ async def render_html_list_to_zip(html_list, zip_file, *, scale: float = 2.0, pr
 
             # auto-fit width để không thừa khung trắng
             try:
-                dims = await page.evaluate("() => ({w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight})")
+                dims = await page.evaluate(
+                    "() => ({w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight})"
+                )
                 w = int(dims.get("w", 1200))
                 w = max(980, min(3500, w + 6))
-                await page.setViewport({"width": w, "height": 900, "deviceScaleFactor": float(scale)})
+                await page.setViewport({"width": w, "height": 900})
             except:
                 pass
 
@@ -382,29 +345,16 @@ async def render_html_list_to_zip(html_list, zip_file, *, scale: float = 2.0, pr
 
     return exported
 
-# =========================
-# UI: SETTINGS (watermark/stamp + scale + spool)
-# =========================
-with st.expander("⚙️ Cấu hình xuất ảnh (nét/ZIP/Watermark/Stamp)", expanded=True):
-    c1, c2, c3 = st.columns([1.2, 1.2, 1.6])
-
-    with c1:
-        scale = st.slider("Độ nét ảnh (deviceScaleFactor)", min_value=1.0, max_value=3.0, value=2.0, step=0.25)
-        st.caption("Gợi ý: 2.0 rất nét; 2.5–3.0 cực nét nhưng nặng hơn.")
-
-    with c2:
-        spool_mb = st.slider("Ngưỡng RAM cho ZIP (MB)", min_value=10, max_value=200, value=80, step=10)
-        st.caption("ZIP vượt ngưỡng sẽ tự đổ ra disk tạm, giảm rủi ro Out-Of-Memory.")
-
-    with c3:
-        st.markdown("**Watermark / Stamp**")
-        show_watermark = st.checkbox("Hiển thị Watermark (giữa dưới)", value=True)
-        watermark_text = st.text_input("Nội dung Watermark", value=DEFAULT_WATERMARK, disabled=(not show_watermark))
-
-        show_stamp = st.checkbox("Hiển thị Stamp (góc dưới trái)", value=True)
-        stamp_mode = st.selectbox("Stamp theo", options=["Tên sheet", "Custom"], index=0, disabled=(not show_stamp))
-        stamp_custom = st.text_input("Stamp custom (dùng {sheet})", value="{sheet}", disabled=(not show_stamp or stamp_mode != "Custom"))
-        st.caption("Ví dụ custom: Ảnh: {sheet} | Công ty ABC")
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            loop.close()
+        except:
+            pass
 
 # =========================
 # UI: Upload
@@ -432,6 +382,7 @@ for sn in wb.sheetnames:
     headers = [normalize_header(h) for h in list(first_row[0])]
     headers = [h for h in headers if h != ""]
     all_headers.extend(headers)
+
 all_headers = unique_preserve_order(all_headers)
 
 st.subheader("Chọn cột muốn in ra ảnh")
@@ -490,7 +441,7 @@ if not selected_headers:
 # =========================
 # PROCESS SHEETS -> HTML LIST
 # =========================
-prepare_bar = st.progress(0)
+progress = st.progress(0)
 status = st.empty()
 
 to_render = []
@@ -516,7 +467,7 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
         hl.append(row_hls)
 
     if len(data) < 2:
-        prepare_bar.progress(idx_sheet / max(total_sheets, 1))
+        progress.progress(idx_sheet / max(total_sheets, 1))
         continue
 
     for r in range(len(data)):
@@ -532,7 +483,7 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
             keep_cols.append(j)
 
     if not keep_cols:
-        prepare_bar.progress(idx_sheet / max(total_sheets, 1))
+        progress.progress(idx_sheet / max(total_sheets, 1))
         continue
 
     headers_full = [normalize_header(data[0][j]) for j in keep_cols]
@@ -546,7 +497,7 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
             headers2.append(hname)
 
     if not keep_cols2:
-        prepare_bar.progress(idx_sheet / max(total_sheets, 1))
+        progress.progress(idx_sheet / max(total_sheets, 1))
         continue
 
     body_rows_raw = [[data[i][j] for j in keep_cols2] for i in range(1, len(data))]
@@ -578,7 +529,7 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
             stt_val = str(stt_counter)
 
         # RULE tô đỏ:
-        # - Nếu có cả 100% và 130%: chỉ khi có data và (100 + 130) < 8 => tô đỏ cả 2 ô (nền hồng)
+        # - Nếu có cả 100% và 130%: chỉ khi có data và (100 + 130) < 8 => tô đỏ cả 2 ô
         # - Nếu chỉ có 100%: chỉ khi có data và 100 < 8 => chữ đỏ + đậm (không nền)
         low_bg_cols = set()    # lowhour
         low_text_cols = set()  # lowtext
@@ -626,34 +577,12 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
 
         rows_for_html.append({"is_total": is_total, "cells": cells})
 
-    # Stamp text theo UI
-    sheet_safe = safe_sheet_filename(sheet_name)
-    if show_stamp:
-        if stamp_mode == "Tên sheet":
-            stamp_text = sheet_safe
-        else:
-            try:
-                stamp_text = (stamp_custom or "{sheet}").format(sheet=sheet_safe)
-            except:
-                stamp_text = sheet_safe
-    else:
-        stamp_text = ""
-
-    html_doc = build_html(
-        sheet_name,
-        headers_out,
-        rows_for_html,
-        show_stamp=show_stamp,
-        stamp_text=stamp_text,
-        show_watermark=show_watermark,
-        watermark_text=(watermark_text or DEFAULT_WATERMARK),
-    )
-
-    # tên file có thứ tự cho chuyên nghiệp
-    fname = f"{idx_sheet:03d}_{sheet_safe}.png"
+    stamp_text = safe_sheet_filename(sheet_name)  # đóng dấu góc dưới trái
+    html_doc = build_html(sheet_name, headers_out, rows_for_html, stamp_text=stamp_text)
+    fname = safe_sheet_filename(sheet_name) + ".png"
     to_render.append((fname, html_doc))
 
-    prepare_bar.progress(idx_sheet / max(total_sheets, 1))
+    progress.progress(idx_sheet / max(total_sheets, 1))
 
 status.info("Đang xuất file ảnh..")
 
@@ -662,33 +591,23 @@ if not to_render:
     st.stop()
 
 # =========================
-# RENDER + ZIP (progress + count) + SpooledTemporaryFile
+# RENDER + ZIP (progress + count)
 # =========================
-render_bar = st.progress(0.0)
+render_bar = st.progress(0)
 render_text = st.empty()
 
 def progress_cb(done, total, current_name):
     done = max(0, min(done, total))
-    pct = 0.0 if total == 0 else float(done) / float(total)
+    pct = 0 if total == 0 else done / total
     render_bar.progress(pct)
     render_text.info(f"Render {done}/{total}: **{current_name}**")
 
+zip_buf = BytesIO()
 exported_count = 0
 
-# Spooled: nhỏ thì RAM, vượt ngưỡng thì đổ ra disk tạm
-zip_spool = tempfile.SpooledTemporaryFile(
-    max_size=int(spool_mb) * 1024 * 1024,
-    mode="w+b"
-)
-
 try:
-    with zipfile.ZipFile(zip_spool, "w", zipfile.ZIP_DEFLATED) as z:
-        exported_count = run_async(render_html_list_to_zip(
-            to_render,
-            z,
-            scale=float(scale),
-            progress_cb=progress_cb
-        ))
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
+        exported_count = run_async(render_html_list_to_zip(to_render, z, progress_cb=progress_cb))
 except Exception as e:
     st.error(
         "Lỗi render Chromium.\n\n"
@@ -698,12 +617,6 @@ except Exception as e:
         "- Trên Streamlit Cloud bấm Reboot app để rebuild môi trường"
     )
     st.stop()
-finally:
-    # reset về đầu để download
-    try:
-        zip_spool.seek(0)
-    except:
-        pass
 
 render_bar.empty()
 render_text.empty()
@@ -711,7 +624,7 @@ render_text.empty()
 status.success(f"✅ Xong! Đã xuất **{exported_count}** file ảnh và nén ZIP.")
 st.download_button(
     "📥 Tải ZIP ảnh PNG",
-    data=zip_spool,
+    data=zip_buf.getvalue(),
     file_name="bang_cong_png.zip",
     mime="application/zip",
 )
