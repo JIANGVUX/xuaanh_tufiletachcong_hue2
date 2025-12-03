@@ -1,9 +1,9 @@
 import asyncio
+import hashlib
 import html
 import os
 import re
 import zipfile
-import tempfile
 from datetime import datetime, date, time
 from io import BytesIO
 from pathlib import Path
@@ -20,16 +20,55 @@ st.title("Xuất bảng công cho từng nhân viên - by Jiangvux")
 # Cache Chromium của pyppeteer vào HOME để ổn định trên Streamlit Cloud
 os.environ.setdefault("PYPPETEER_HOME", str(Path.home() / ".cache" / "pyppeteer"))
 
-# =========================
-# DEFAULT TEXT
-# =========================
 DEFAULT_WATERMARK = "Liên hệ Nguyễn Huệ Hr ( 0356 227 868 ) - timvieclam.9phut.com"
+DEFAULT_THRESHOLD = 8.0
+
 
 # =========================
-# CSS TEMPLATE (dynamic parts injected in build_html)
+# UI: Sidebar config (watermark/stamp/scale/perf)
 # =========================
-CSS_BASE = r"""
-:root{
+st.sidebar.header("⚙️ Cấu hình xuất ảnh")
+
+device_scale = st.sidebar.slider(
+    "Độ nét (deviceScaleFactor) — càng cao càng nét nhưng nặng/chậm",
+    min_value=1.0, max_value=3.0, value=1.8, step=0.1
+)
+auto_fit_width = st.sidebar.checkbox("Auto-fit chiều ngang (giảm thừa khung trắng)", value=True)
+
+min_width = st.sidebar.number_input("Min width (px)", min_value=600, max_value=6000, value=980, step=10)
+max_width = st.sidebar.number_input("Max width (px)", min_value=800, max_value=12000, value=3500, step=10)
+
+wait_ms = st.sidebar.slider("Chờ layout sau setContent (ms)", min_value=0, max_value=300, value=60, step=10)
+
+add_stt = st.sidebar.checkbox("Thêm cột STT", value=True)
+
+threshold_hours = st.sidebar.number_input(
+    "Ngưỡng giờ chuẩn (>= ngưỡng thì để nguyên, < ngưỡng thì tô đỏ)",
+    min_value=0.0, max_value=24.0, value=float(DEFAULT_THRESHOLD), step=0.5
+)
+
+st.sidebar.divider()
+st.sidebar.subheader("Watermark / Stamp (đóng dấu)")
+
+show_watermark = st.sidebar.checkbox("Hiển thị Watermark (giữa dưới)", value=True)
+watermark_text = st.sidebar.text_input("Nội dung Watermark", value=DEFAULT_WATERMARK)
+watermark_size = st.sidebar.slider("Cỡ chữ Watermark", 10, 30, 18)
+
+show_stamp = st.sidebar.checkbox("Hiển thị Stamp (góc dưới trái)", value=True)
+stamp_mode = st.sidebar.selectbox("Nội dung Stamp", ["Tên sheet", "Tên file ảnh", "Tùy chỉnh"], index=0)
+stamp_custom = st.sidebar.text_input("Stamp tùy chỉnh", value="", disabled=(stamp_mode != "Tùy chỉnh"))
+stamp_size = st.sidebar.slider("Cỡ chữ Stamp", 10, 26, 16)
+
+st.sidebar.divider()
+st.sidebar.caption("Gợi ý: nếu thấy chậm, giảm deviceScaleFactor xuống 1.4–1.8 và giảm số cột giữ lại.")
+
+
+# =========================
+# CSS (dynamic)
+# =========================
+def build_css(wm_size: int, sp_size: int) -> str:
+    return f"""
+:root {{
   --bg:#ffffff;
   --bar:#3a3a3a;
   --barText:#ffffff;
@@ -40,15 +79,15 @@ CSS_BASE = r"""
   --excelGreen:#217346;
   --danger:#e60023;
   --dangerBg:#ffe6ea;
-}
-*{box-sizing:border-box;}
-html,body{margin:0;padding:0;background:var(--bg);}
-body{
+}}
+*{{box-sizing:border-box;}}
+html,body{{margin:0;padding:0;background:var(--bg);}}
+body{{
   font-family: Arial, Helvetica, "DejaVu Sans", "Liberation Sans", sans-serif;
   color:#111;
-}
-.wrap{padding:14px 14px 22px;}
-.titlebar{
+}}
+.wrap{{padding:14px 14px 22px;}}
+.titlebar{{
   background:var(--bar);
   color:var(--barText);
   text-align:center;
@@ -58,68 +97,70 @@ body{
   font-size:22px;
   letter-spacing:.2px;
   margin:0 0 12px 0;
-}
-table{
+}}
+table{{
   border-collapse:collapse;
   width:100%;
   table-layout:auto;
   font-size:14px;
-}
-th, td{
+}}
+th,td{{
   border:1px solid var(--grid);
   padding:8px 10px;
   text-align:center;
   white-space:nowrap;
-}
-thead th{background:var(--head);font-weight:800;}
-tbody tr:nth-child(even){background:var(--even);}
+}}
+thead th{{background:var(--head);font-weight:800;}}
+tbody tr:nth-child(even){{background:var(--even);}}
 
-td.highlight{
+/* Highlight từ Excel */
+td.highlight{{
   background:var(--excelGreen) !important;
   color:#fff !important;
   font-weight:800;
-}
+}}
 
-/* Case: có 100% + 130% và tổng < 8 => nền hồng + chữ đỏ + đậm */
-td.lowhour{
+/* Có 100% + 130% và tổng < ngưỡng => nền hồng + chữ đỏ + đậm */
+td.lowhour{{
   background:var(--dangerBg) !important;
   color:var(--danger) !important;
   font-weight:900 !important;
-}
+}}
 
-/* Case: chỉ có 100% và < 8 => chỉ chữ đỏ + đậm (không tô nền) */
-td.lowtext{
+/* Chỉ có 100% và < ngưỡng => chữ đỏ + đậm (không tô nền) */
+td.lowtext{{
   color:var(--danger) !important;
   font-weight:900 !important;
-}
+}}
 
-tr.total-row td{
+tr.total-row td{{
   background:var(--total) !important;
   color:#fff !important;
   font-weight:900;
-}
+}}
 
-.footer-area{
+.footer-area{{
   position:relative;
   margin-top:14px;
   min-height:26px;
-}
-.stamp{
+}}
+.stamp{{
   position:absolute;
   left:0;
   bottom:0;
-  font-size:16px;
+  font-size:{sp_size}px;
   font-weight:800;
   color:#111;
-}
-.footer{
+}}
+.footer{{
   text-align:center;
-  font-size:18px;
+  font-size:{wm_size}px;
   color:var(--total);
   font-weight:700;
   line-height:26px;
-}
+}}
 """
+
 
 # =========================
 # HELPERS
@@ -146,7 +187,7 @@ def parse_float(val) -> float:
         return 0.0
 
 def detect_highlight(cell) -> bool:
-    """Bắt các ô có tô màu (không tính trắng/đen mặc định)."""
+    """Bắt ô có tô màu."""
     try:
         fill = cell.fill
         if not fill:
@@ -157,7 +198,6 @@ def detect_highlight(cell) -> bool:
         if getattr(fg, "type", None) == "rgb":
             rgb = (fg.rgb or "").upper()
             return rgb not in ("", "00000000", "FFFFFFFF", "FF000000")
-        # Với file dùng theme/pattern, coi là highlight
         if getattr(fill, "patternType", None) or getattr(fill, "fill_type", None):
             return True
         return False
@@ -170,8 +210,8 @@ def is_date_header(h: str) -> bool:
 
 def is_time_header(h: str) -> bool:
     """
-    CHỈ coi là cột giờ nếu là các cột vào/ra.
-    Tránh nhầm số float (0.5, 1.5...) thành giờ 12:00.
+    CHỈ coi là cột giờ nếu là cột vào/ra.
+    Tránh nhầm float 0.5 thành 12:00.
     """
     h = (h or "").lower().strip()
     keys = ["vào", "ra", "gio vao", "gio ra", "giờ vào", "giờ ra", "vao", "ra l", "vào l", "ra lần", "vào lần"]
@@ -192,7 +232,7 @@ def format_cell(value, header_str: str) -> str:
     """
     - Ngày: dd/mm/yyyy
     - Vào/Ra: hh:mm (kể cả float 0..1)
-    - Số bình thường (0.5, 1.25...): giữ số, KHÔNG đổi sang 12:00
+    - Số: giữ số (0.5, 1.25...) KHÔNG đổi sang giờ
     """
     h = header_str or ""
     if value is None:
@@ -220,12 +260,12 @@ def format_cell(value, header_str: str) -> str:
     return str(value).strip()
 
 def is_col_100(h: str) -> bool:
-    """Lương giờ HC tương đương Lương giờ 100%"""
+    """Lương giờ HC ~ Lương giờ 100%"""
     s = (h or "").lower()
     return ("lương giờ 100%" in s) or ("luong gio 100%" in s) or ("lương giờ hc" in s) or ("luong gio hc" in s) or ("gio 100%" in s)
 
 def is_col_130(h: str) -> bool:
-    """Lương giờ ca đêm tương đương Lương giờ 130%"""
+    """Lương giờ ca đêm ~ Lương giờ 130%"""
     s = (h or "").lower()
     return ("lương giờ 130%" in s) or ("luong gio 130%" in s) or ("lương giờ ca đêm" in s) or ("luong gio ca dem" in s) or ("ca đêm" in s) or ("ca dem" in s) or ("tc 130" in s) or ("tăng ca 130" in s)
 
@@ -241,14 +281,15 @@ def unique_preserve_order(items):
             out.append(it)
     return out
 
-def build_html(sheet_name: str, headers: list, rows: list, *,
-              show_stamp: bool, stamp_text: str,
-              show_watermark: bool, watermark_text: str) -> str:
-    """
-    Build HTML với:
-    - Stamp (góc dưới trái) bật/tắt
-    - Watermark (giữa dưới) bật/tắt
-    """
+def is_total_row(row_vals) -> bool:
+    # Bền hơn khi user bỏ vài cột đầu: dò "tổng" trong vài ô đầu
+    for v in row_vals[: min(6, len(row_vals))]:
+        if str(v).strip().lower() in ("tổng", "tong"):
+            return True
+    return False
+
+def build_html(sheet_name: str, headers: list, rows: list, stamp_text: str, cfg_css: str,
+              watermark: str, show_wm: bool, show_st: bool) -> str:
     ths = "".join(f"<th>{html.escape(str(h) if h is not None else '')}</th>" for h in headers)
 
     trs = []
@@ -267,23 +308,15 @@ def build_html(sheet_name: str, headers: list, rows: list, *,
             tds.append(f"<td{class_attr}>{c['value_html']}</td>")
         trs.append(f'<tr class="{tr_cls}">{"".join(tds)}</tr>')
 
-    footer_html = ""
-    if show_stamp or show_watermark:
-        stamp_div = f'<div class="stamp">{html.escape(stamp_text)}</div>' if show_stamp else ""
-        watermark_div = f'<div class="footer">{html.escape(watermark_text)}</div>' if show_watermark else ""
-        footer_html = f"""
-        <div class="footer-area">
-          {stamp_div}
-          {watermark_div}
-        </div>
-        """
+    stamp_html = f'<div class="stamp">{html.escape(stamp_text)}</div>' if (show_st and stamp_text) else ""
+    wm_html = f'<div class="footer">{html.escape(watermark)}</div>' if (show_wm and watermark) else ""
 
     return f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<style>{CSS_BASE}</style>
+<style>{cfg_css}</style>
 </head>
 <body>
   <div class="wrap">
@@ -294,34 +327,25 @@ def build_html(sheet_name: str, headers: list, rows: list, *,
         {''.join(trs)}
       </tbody>
     </table>
-    {footer_html}
+    <div class="footer-area">
+      {stamp_html}
+      {wm_html}
+    </div>
   </div>
 </body>
 </html>
 """
 
-# =========================
-# ASYNC UTILS
-# =========================
-def run_async(coro):
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(coro)
-    finally:
-        try:
-            loop.close()
-        except:
-            pass
 
 # =========================
 # PYPPETEER RENDER (write straight to ZIP + return count)
 # =========================
-async def render_html_list_to_zip(html_list, zip_file, *, scale: float = 2.0, progress_cb=None):
+async def render_html_list_to_zip(html_list, zip_file, progress_cb=None,
+                                 dsf: float = 1.8, auto_fit: bool = True,
+                                 min_w: int = 980, max_w: int = 3500, wait_ms: int = 60):
     """
-    Render lần lượt từng HTML -> PNG và ghi trực tiếp vào zip_file.
-    - scale: deviceScaleFactor (1.0 ~ 3.0). Càng cao càng nét (nhưng nặng hơn).
-    Return: số file đã ghi vào ZIP.
+    Render từng HTML -> PNG và ghi trực tiếp vào zip_file.
+    Return: số file đã ghi ZIP.
     """
     from pyppeteer import launch
 
@@ -343,7 +367,7 @@ async def render_html_list_to_zip(html_list, zip_file, *, scale: float = 2.0, pr
     exported = 0
     try:
         page = await browser.newPage()
-        await page.setViewport({"width": 1200, "height": 900, "deviceScaleFactor": float(scale)})
+        await page.setViewport({"width": min_w, "height": 900, "deviceScaleFactor": float(dsf)})
 
         total = len(html_list)
         for i, (fname, html_str) in enumerate(html_list, start=1):
@@ -352,20 +376,22 @@ async def render_html_list_to_zip(html_list, zip_file, *, scale: float = 2.0, pr
 
             await page.setContent(html_str)
 
-            # chờ layout ổn định một chút
-            try:
-                await page.waitFor(80)
-            except:
-                pass
+            if wait_ms > 0:
+                try:
+                    await page.waitFor(int(wait_ms))
+                except:
+                    pass
 
-            # auto-fit width để không thừa khung trắng
-            try:
-                dims = await page.evaluate("() => ({w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight})")
-                w = int(dims.get("w", 1200))
-                w = max(980, min(3500, w + 6))
-                await page.setViewport({"width": w, "height": 900, "deviceScaleFactor": float(scale)})
-            except:
-                pass
+            if auto_fit:
+                try:
+                    dims = await page.evaluate(
+                        "() => ({w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight})"
+                    )
+                    w = int(dims.get("w", min_w))
+                    w = max(int(min_w), min(int(max_w), w + 6))
+                    await page.setViewport({"width": w, "height": 900, "deviceScaleFactor": float(dsf)})
+                except:
+                    pass
 
             png_bytes = await page.screenshot({"fullPage": True, "type": "png"})
             zip_file.writestr(fname, png_bytes)
@@ -382,57 +408,67 @@ async def render_html_list_to_zip(html_list, zip_file, *, scale: float = 2.0, pr
 
     return exported
 
-# =========================
-# UI: SETTINGS (watermark/stamp + scale + spool)
-# =========================
-with st.expander("⚙️ Cấu hình xuất ảnh (nét/ZIP/Watermark/Stamp)", expanded=True):
-    c1, c2, c3 = st.columns([1.2, 1.2, 1.6])
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            loop.close()
+        except:
+            pass
 
-    with c1:
-        scale = st.slider("Độ nét ảnh (deviceScaleFactor)", min_value=1.0, max_value=3.0, value=2.0, step=0.25)
-        st.caption("Gợi ý: 2.0 rất nét; 2.5–3.0 cực nét nhưng nặng hơn.")
-
-    with c2:
-        spool_mb = st.slider("Ngưỡng RAM cho ZIP (MB)", min_value=10, max_value=200, value=80, step=10)
-        st.caption("ZIP vượt ngưỡng sẽ tự đổ ra disk tạm, giảm rủi ro Out-Of-Memory.")
-
-    with c3:
-        st.markdown("**Watermark / Stamp**")
-        show_watermark = st.checkbox("Hiển thị Watermark (giữa dưới)", value=True)
-        watermark_text = st.text_input("Nội dung Watermark", value=DEFAULT_WATERMARK, disabled=(not show_watermark))
-
-        show_stamp = st.checkbox("Hiển thị Stamp (góc dưới trái)", value=True)
-        stamp_mode = st.selectbox("Stamp theo", options=["Tên sheet", "Custom"], index=0, disabled=(not show_stamp))
-        stamp_custom = st.text_input("Stamp custom (dùng {sheet})", value="{sheet}", disabled=(not show_stamp or stamp_mode != "Custom"))
-        st.caption("Ví dụ custom: Ảnh: {sheet} | Công ty ABC")
 
 # =========================
-# UI: Upload
+# UI: Upload + cache workbook in session_state (giảm load lại khi tick checkbox)
 # =========================
 uploaded = st.file_uploader("Chọn file Excel đã tổng hợp (.xlsx)", type=["xlsx"])
 if not uploaded:
     st.info("Hãy upload file Excel tổng hợp để bắt đầu.")
     st.stop()
 
-try:
-    wb = load_workbook(uploaded, data_only=True)
-except Exception as e:
-    st.error(f"Không đọc được file Excel. Lỗi: {e}")
-    st.stop()
+file_bytes = uploaded.getvalue()
+file_md5 = hashlib.md5(file_bytes).hexdigest()
+
+if st.session_state.get("file_md5") != file_md5:
+    st.session_state.file_md5 = file_md5
+    st.session_state.wb = load_workbook(BytesIO(file_bytes), data_only=True)
+    st.session_state.all_headers = None
+    st.session_state.selected_headers = None
+    # clear checkbox states (tránh lệch key)
+    for k in list(st.session_state.keys()):
+        if isinstance(k, str) and k.startswith("hdr__"):
+            del st.session_state[k]
+
+wb = st.session_state.wb
+
 
 # =========================
 # UI: Column selection (NO auto render)
 # =========================
-all_headers = []
-for sn in wb.sheetnames:
-    ws = wb[sn]
-    first_row = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))
-    if not first_row:
-        continue
-    headers = [normalize_header(h) for h in list(first_row[0])]
-    headers = [h for h in headers if h != ""]
-    all_headers.extend(headers)
-all_headers = unique_preserve_order(all_headers)
+def hdr_key(h: str) -> str:
+    # key ổn định theo tên cột
+    hx = hashlib.md5(h.encode("utf-8")).hexdigest()[:10]
+    return f"hdr__{hx}"
+
+if st.session_state.get("all_headers") is None:
+    all_headers = []
+    for sn in wb.sheetnames:
+        ws = wb[sn]
+        first_row = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+        if not first_row:
+            continue
+        headers = [normalize_header(x) for x in list(first_row[0])]
+        headers = [h for h in headers if h != ""]
+        all_headers.extend(headers)
+    all_headers = unique_preserve_order(all_headers)
+    st.session_state.all_headers = all_headers
+
+if st.session_state.get("selected_headers") is None:
+    st.session_state.selected_headers = set(st.session_state.all_headers)
+
+all_headers = st.session_state.all_headers
 
 st.subheader("Chọn cột muốn in ra ảnh")
 st.caption("Tick cột nào thì ảnh sẽ giữ cột đó. Bỏ tick thì loại khỏi ảnh (áp dụng cho tất cả sheet).")
@@ -441,38 +477,43 @@ if not all_headers:
     st.warning("Không tìm thấy header (dòng tiêu đề) trong file.")
     st.stop()
 
-if "selected_headers" not in st.session_state:
-    st.session_state.selected_headers = set(all_headers)
-
 colA, colB, colC = st.columns([1, 1, 3])
 with colA:
     if st.button("✅ Chọn tất cả"):
         st.session_state.selected_headers = set(all_headers)
+        for h in all_headers:
+            st.session_state[hdr_key(h)] = True
 with colB:
     if st.button("🧹 Bỏ chọn tất cả"):
         st.session_state.selected_headers = set()
+        for h in all_headers:
+            st.session_state[hdr_key(h)] = False
 
 search = colC.text_input("🔎 Tìm cột", value="", placeholder="Ví dụ: lương, vào, ra, tăng ca...").strip().lower()
 filtered_headers = [h for h in all_headers if (search in h.lower())] if search else all_headers
 
+# render checkboxes grid
 grid_cols = st.columns(4)
-for i, h in enumerate(filtered_headers):
-    col = grid_cols[i % 4]
-    key = f"col_{all_headers.index(h)}"
-    default_checked = h in st.session_state.selected_headers
-    checked = col.checkbox(h, value=default_checked, key=key)
-    if checked:
-        st.session_state.selected_headers.add(h)
-    else:
-        st.session_state.selected_headers.discard(h)
+selected = set(st.session_state.selected_headers)
 
-selected_headers = set(st.session_state.selected_headers)
+for i, h in enumerate(filtered_headers):
+    key = hdr_key(h)
+    if key not in st.session_state:
+        st.session_state[key] = (h in selected)
+
+    col = grid_cols[i % 4]
+    col.checkbox(h, key=key)
+
+# sync selected_headers
+selected_headers = set()
+for h in all_headers:
+    if st.session_state.get(hdr_key(h), False):
+        selected_headers.add(h)
+
+st.session_state.selected_headers = selected_headers
 
 st.divider()
 
-# =========================
-# Render Button
-# =========================
 btn_col1, btn_col2 = st.columns([1, 3])
 with btn_col1:
     render_clicked = st.button("🚀 Xuất File", type="primary", use_container_width=True)
@@ -487,15 +528,21 @@ if not selected_headers:
     st.error("Bạn đang bỏ chọn hết cột. Hãy tick ít nhất 1 cột để xuất ảnh.")
     st.stop()
 
+
 # =========================
 # PROCESS SHEETS -> HTML LIST
 # =========================
-prepare_bar = st.progress(0)
+progress = st.progress(0.0)
 status = st.empty()
+
+cfg_css = build_css(watermark_size, stamp_size)
 
 to_render = []
 sheetnames = wb.sheetnames
 total_sheets = len(sheetnames)
+
+prepared = 0
+skipped = 0
 
 for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
     status.info(f"Đang chuẩn bị sheet {idx_sheet}/{total_sheets}: **{sheet_name}**")
@@ -509,30 +556,33 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
         row_vals = []
         row_hls = []
         for cell in row:
-            row_vals.append("" if cell.value is None else cell.value)
+            row_vals.append(cell.value)
             row_hls.append(detect_highlight(cell))
         max_cols = max(max_cols, len(row_vals))
         data.append(row_vals)
         hl.append(row_hls)
 
     if len(data) < 2:
-        prepare_bar.progress(idx_sheet / max(total_sheets, 1))
+        skipped += 1
+        progress.progress(idx_sheet / max(total_sheets, 1))
         continue
 
+    # pad rows
     for r in range(len(data)):
         if len(data[r]) < max_cols:
-            data[r].extend([""] * (max_cols - len(data[r])))
+            data[r].extend([None] * (max_cols - len(data[r])))
         if len(hl[r]) < max_cols:
             hl[r].extend([False] * (max_cols - len(hl[r])))
 
-    # keep_cols: cột nào có dữ liệu ở body
+    # keep columns that have any data in body (rows 2..n)
     keep_cols = []
     for j in range(max_cols):
         if any(not is_empty_value(data[i][j]) for i in range(1, len(data))):
             keep_cols.append(j)
 
     if not keep_cols:
-        prepare_bar.progress(idx_sheet / max(total_sheets, 1))
+        skipped += 1
+        progress.progress(idx_sheet / max(total_sheets, 1))
         continue
 
     headers_full = [normalize_header(data[0][j]) for j in keep_cols]
@@ -546,7 +596,8 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
             headers2.append(hname)
 
     if not keep_cols2:
-        prepare_bar.progress(idx_sheet / max(total_sheets, 1))
+        skipped += 1
+        progress.progress(idx_sheet / max(total_sheets, 1))
         continue
 
     body_rows_raw = [[data[i][j] for j in keep_cols2] for i in range(1, len(data))]
@@ -561,28 +612,26 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
         if col_130 is None and is_col_130(h):
             col_130 = i
 
-    # add cột STT ở đầu
-    headers_out = ["STT"] + headers2
+    headers_out = (["STT"] + headers2) if add_stt else headers2
 
     rows_for_html = []
     stt_counter = 0
 
     for r_idx, row in enumerate(body_rows_raw):
-        first_cell = str(row[0]).strip().lower()
-        is_total = first_cell in ("tổng", "tong")
+        is_total = is_total_row(row)
 
-        # STT: chỉ đánh số cho dòng thường, dòng tổng để trống
+        # STT
         stt_val = ""
-        if not is_total:
+        if add_stt and (not is_total):
             stt_counter += 1
             stt_val = str(stt_counter)
 
-        # RULE tô đỏ:
-        # - Nếu có cả 100% và 130%: chỉ khi có data và (100 + 130) < 8 => tô đỏ cả 2 ô (nền hồng)
-        # - Nếu chỉ có 100%: chỉ khi có data và 100 < 8 => chữ đỏ + đậm (không nền)
-        low_bg_cols = set()    # lowhour
-        low_text_cols = set()  # lowtext
+        low_bg_cols = set()    # tô nền + đỏ (100% + 130%)
+        low_text_cols = set()  # chỉ chữ đỏ (chỉ 100%)
 
+        # logic tô đỏ của bạn:
+        # - nếu có cả 100% và 130%: ô nào có dữ liệu, nếu (100+130) < threshold => tô đỏ cả 2 ô
+        # - nếu chỉ có 100%: nếu ô 100% có dữ liệu và < threshold => chữ đỏ + đậm ô 100%
         if (not is_total) and (col_100 is not None) and (col_130 is not None):
             raw100 = row[col_100]
             raw130 = row[col_130]
@@ -590,7 +639,7 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
             if has_data:
                 v100 = parse_float(raw100)
                 v130 = parse_float(raw130)
-                if (v100 + v130) < 8:
+                if (v100 + v130) < float(threshold_hours):
                     low_bg_cols.add(col_100)
                     low_bg_cols.add(col_130)
 
@@ -599,20 +648,19 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
             has_data = not is_empty_value(raw100)
             if has_data:
                 v100 = parse_float(raw100)
-                if v100 < 8:
+                if v100 < float(threshold_hours):
                     low_text_cols.add(col_100)
 
         cells = []
 
-        # STT cell
-        cells.append({
-            "value_html": html.escape(stt_val),
-            "highlight": False,
-            "lowhour": False,
-            "lowtext": False,
-        })
+        if add_stt:
+            cells.append({
+                "value_html": html.escape(stt_val),
+                "highlight": False,
+                "lowhour": False,
+                "lowtext": False,
+            })
 
-        # data cells
         for c_idx, val in enumerate(row):
             formatted = format_cell(val, headers2[c_idx])
             highlight = bool(hl_rows[r_idx][c_idx]) if r_idx < len(hl_rows) and c_idx < len(hl_rows[r_idx]) else False
@@ -626,92 +674,94 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
 
         rows_for_html.append({"is_total": is_total, "cells": cells})
 
-    # Stamp text theo UI
-    sheet_safe = safe_sheet_filename(sheet_name)
-    if show_stamp:
-        if stamp_mode == "Tên sheet":
-            stamp_text = sheet_safe
-        else:
-            try:
-                stamp_text = (stamp_custom or "{sheet}").format(sheet=sheet_safe)
-            except:
-                stamp_text = sheet_safe
+    # stamp text theo UI
+    fname = safe_sheet_filename(sheet_name) + ".png"
+    if stamp_mode == "Tên sheet":
+        stamp_text = safe_sheet_filename(sheet_name)
+    elif stamp_mode == "Tên file ảnh":
+        stamp_text = fname
     else:
-        stamp_text = ""
+        stamp_text = (stamp_custom or "").strip()
 
     html_doc = build_html(
-        sheet_name,
-        headers_out,
-        rows_for_html,
-        show_stamp=show_stamp,
+        sheet_name=sheet_name,
+        headers=headers_out,
+        rows=rows_for_html,
         stamp_text=stamp_text,
-        show_watermark=show_watermark,
-        watermark_text=(watermark_text or DEFAULT_WATERMARK),
+        cfg_css=cfg_css,
+        watermark=watermark_text,
+        show_wm=show_watermark,
+        show_st=show_stamp,
     )
 
-    # tên file có thứ tự cho chuyên nghiệp
-    fname = f"{idx_sheet:03d}_{sheet_safe}.png"
     to_render.append((fname, html_doc))
+    prepared += 1
 
-    prepare_bar.progress(idx_sheet / max(total_sheets, 1))
+    progress.progress(idx_sheet / max(total_sheets, 1))
 
-status.info("Đang xuất file ảnh..")
+status.info("Đang xuất file ảnh (Chromium)...")
 
 if not to_render:
     st.warning("Không có sheet nào có cột được chọn để xuất ảnh.")
     st.stop()
 
+
 # =========================
-# RENDER + ZIP (progress + count) + SpooledTemporaryFile
+# RENDER + ZIP (progress + count) + FIX download_button
 # =========================
 render_bar = st.progress(0.0)
 render_text = st.empty()
 
 def progress_cb(done, total, current_name):
     done = max(0, min(done, total))
-    pct = 0.0 if total == 0 else float(done) / float(total)
+    pct = 0.0 if total == 0 else done / total
     render_bar.progress(pct)
     render_text.info(f"Render {done}/{total}: **{current_name}**")
 
+zip_buf = BytesIO()
 exported_count = 0
 
-# Spooled: nhỏ thì RAM, vượt ngưỡng thì đổ ra disk tạm
-zip_spool = tempfile.SpooledTemporaryFile(
-    max_size=int(spool_mb) * 1024 * 1024,
-    mode="w+b"
-)
-
 try:
-    with zipfile.ZipFile(zip_spool, "w", zipfile.ZIP_DEFLATED) as z:
-        exported_count = run_async(render_html_list_to_zip(
-            to_render,
-            z,
-            scale=float(scale),
-            progress_cb=progress_cb
-        ))
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
+        exported_count = run_async(
+            render_html_list_to_zip(
+                to_render,
+                z,
+                progress_cb=progress_cb,
+                dsf=device_scale,
+                auto_fit=auto_fit_width,
+                min_w=int(min_width),
+                max_w=int(max_width),
+                wait_ms=int(wait_ms),
+            )
+        )
 except Exception as e:
     st.error(
         "Lỗi render Chromium.\n\n"
         f"Chi tiết: {e}\n\n"
         "Nếu browser crash:\n"
-        "- Đảm bảo đã commit: runtime.txt (python-3.11), requirements.txt (pyppeteer==1.0.2), packages.txt\n"
+        "- Đảm bảo requirements.txt có pyppeteer==1.0.2\n"
+        "- packages.txt đủ libs (libnss3, libgtk-3-0, fonts...)\n"
         "- Trên Streamlit Cloud bấm Reboot app để rebuild môi trường"
     )
     st.stop()
-finally:
-    # reset về đầu để download
-    try:
-        zip_spool.seek(0)
-    except:
-        pass
 
 render_bar.empty()
 render_text.empty()
 
-status.success(f"✅ Xong! Đã xuất **{exported_count}** file ảnh và nén ZIP.")
+# ✅ FIX LỖI 'Invalid binary data format'
+zip_buf.seek(0)
+zip_bytes = zip_buf.getvalue()  # bytes (Streamlit download_button chắc chắn nhận)
+zip_mb = len(zip_bytes) / (1024 * 1024)
+
+status.success(
+    f"✅ Xong! Chuẩn bị {prepared}/{total_sheets} sheet (bỏ qua {skipped}), "
+    f"đã xuất **{exported_count}** ảnh. ZIP ~ **{zip_mb:.2f} MB**"
+)
+
 st.download_button(
     "📥 Tải ZIP ảnh PNG",
-    data=zip_spool,
+    data=zip_bytes,
     file_name="bang_cong_png.zip",
     mime="application/zip",
 )
