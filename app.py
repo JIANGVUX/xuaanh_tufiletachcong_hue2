@@ -3,13 +3,27 @@ import hashlib
 import html
 import os
 import re
+import sys
+import time
 import zipfile
-from datetime import datetime, date, time
+from datetime import datetime, date, time as dtime
 from io import BytesIO
 from pathlib import Path
+from tempfile import SpooledTemporaryFile
 
 import streamlit as st
 from openpyxl import load_workbook
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    import resource  # Linux/Unix (Streamlit Cloud OK)
+except Exception:
+    resource = None
+
 
 # =========================
 # STREAMLIT CONFIG
@@ -25,7 +39,7 @@ DEFAULT_THRESHOLD = 8.0
 
 
 # =========================
-# UI: Sidebar config (watermark/stamp/scale/perf)
+# UI: Sidebar config
 # =========================
 st.sidebar.header("⚙️ Cấu hình xuất ảnh")
 
@@ -61,6 +75,65 @@ stamp_size = st.sidebar.slider("Cỡ chữ Stamp", 10, 26, 16)
 
 st.sidebar.divider()
 st.sidebar.caption("Gợi ý: nếu thấy chậm, giảm deviceScaleFactor xuống 1.4–1.8 và giảm số cột giữ lại.")
+
+
+# =========================
+# RAM UI
+# =========================
+mem_box = st.sidebar.expander("📈 RAM đang dùng", expanded=True)
+mem_placeholder = mem_box.empty()
+_mem_peak_mb = 0.0
+_t0 = time.perf_counter()
+
+def _read_ram():
+    cur_mb = None
+    peak_mb = None
+    sys_used_pct = None
+    sys_avail_mb = None
+    sys_total_mb = None
+
+    if psutil is not None:
+        try:
+            p = psutil.Process(os.getpid())
+            cur_mb = p.memory_info().rss / (1024 * 1024)
+
+            vm = psutil.virtual_memory()
+            sys_used_pct = float(vm.percent)
+            sys_avail_mb = vm.available / (1024 * 1024)
+            sys_total_mb = vm.total / (1024 * 1024)
+        except Exception:
+            pass
+
+    if resource is not None:
+        try:
+            ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            peak_mb = (ru / (1024 * 1024)) if sys.platform == "darwin" else (ru / 1024.0)
+        except Exception:
+            pass
+
+    if peak_mb is None:
+        peak_mb = cur_mb
+
+    return cur_mb, peak_mb, sys_used_pct, sys_avail_mb, sys_total_mb
+
+def _render_mem_ui(cur_mb, peak_mb, sys_used_pct, sys_avail_mb, sys_total_mb):
+    lines = []
+    if cur_mb is not None:
+        lines.append(f"**RAM process (hiện tại):** `{cur_mb:.0f} MB`")
+    else:
+        lines.append("**RAM process (hiện tại):** `—` *(cài psutil để đo chuẩn)*")
+
+    if peak_mb is not None:
+        lines.append(f"**RAM process (peak):** `{peak_mb:.0f} MB`")
+
+    if sys_used_pct is not None and sys_avail_mb is not None and sys_total_mb is not None:
+        lines.append(f"**RAM hệ thống:** `{sys_used_pct:.0f}%` — còn `{sys_avail_mb:.0f}/{sys_total_mb:.0f} MB`")
+    else:
+        lines.append("**RAM hệ thống:** `—`")
+
+    elapsed = time.perf_counter() - _t0
+    lines.append(f"**Thời gian chạy:** `{elapsed:.1f}s`")
+    mem_placeholder.markdown("\n\n".join(lines))
 
 
 # =========================
@@ -183,11 +256,10 @@ def parse_float(val) -> float:
     s = str(val).strip().replace(",", ".")
     try:
         return float(s)
-    except:
+    except Exception:
         return 0.0
 
 def detect_highlight(cell) -> bool:
-    """Bắt ô có tô màu."""
     try:
         fill = cell.fill
         if not fill:
@@ -201,7 +273,7 @@ def detect_highlight(cell) -> bool:
         if getattr(fill, "patternType", None) or getattr(fill, "fill_type", None):
             return True
         return False
-    except:
+    except Exception:
         return False
 
 def is_date_header(h: str) -> bool:
@@ -209,19 +281,15 @@ def is_date_header(h: str) -> bool:
     return ("ngày" in h) or ("date" in h)
 
 def is_time_header(h: str) -> bool:
-    """
-    CHỈ coi là cột giờ nếu là cột vào/ra.
-    Tránh nhầm float 0.5 thành 12:00.
-    """
     h = (h or "").lower().strip()
     keys = ["vào", "ra", "gio vao", "gio ra", "giờ vào", "giờ ra", "vao", "ra l", "vào l", "ra lần", "vào lần"]
     return any(k in h for k in keys)
 
 def excel_serial_time_to_hhmm(x: float) -> str:
     total_minutes = int(round(float(x) * 24 * 60))
-    h, m = divmod(total_minutes, 60)
-    h %= 24
-    return f"{h:02d}:{m:02d}"
+    hh, mm = divmod(total_minutes, 60)
+    hh %= 24
+    return f"{hh:02d}:{mm:02d}"
 
 def format_number(x: float) -> str:
     if abs(x - round(x)) < 1e-9:
@@ -229,11 +297,6 @@ def format_number(x: float) -> str:
     return f"{x:.2f}".rstrip("0").rstrip(".")
 
 def format_cell(value, header_str: str) -> str:
-    """
-    - Ngày: dd/mm/yyyy
-    - Vào/Ra: hh:mm (kể cả float 0..1)
-    - Số: giữ số (0.5, 1.25...) KHÔNG đổi sang giờ
-    """
     h = header_str or ""
     if value is None:
         return ""
@@ -248,7 +311,7 @@ def format_cell(value, header_str: str) -> str:
     if isinstance(value, date) and not isinstance(value, datetime):
         return value.strftime("%d/%m/%Y")
 
-    if isinstance(value, time):
+    if isinstance(value, dtime):
         return f"{value.hour:02d}:{value.minute:02d}"
 
     if isinstance(value, (float, int)):
@@ -260,12 +323,10 @@ def format_cell(value, header_str: str) -> str:
     return str(value).strip()
 
 def is_col_100(h: str) -> bool:
-    """Lương giờ HC ~ Lương giờ 100%"""
     s = (h or "").lower()
     return ("lương giờ 100%" in s) or ("luong gio 100%" in s) or ("lương giờ hc" in s) or ("luong gio hc" in s) or ("gio 100%" in s)
 
 def is_col_130(h: str) -> bool:
-    """Lương giờ ca đêm ~ Lương giờ 130%"""
     s = (h or "").lower()
     return ("lương giờ 130%" in s) or ("luong gio 130%" in s) or ("lương giờ ca đêm" in s) or ("luong gio ca dem" in s) or ("ca đêm" in s) or ("ca dem" in s) or ("tc 130" in s) or ("tăng ca 130" in s)
 
@@ -282,7 +343,6 @@ def unique_preserve_order(items):
     return out
 
 def is_total_row(row_vals) -> bool:
-    # Bền hơn khi user bỏ vài cột đầu: dò "tổng" trong vài ô đầu
     for v in row_vals[: min(6, len(row_vals))]:
         if str(v).strip().lower() in ("tổng", "tong"):
             return True
@@ -338,15 +398,18 @@ def build_html(sheet_name: str, headers: list, rows: list, stamp_text: str, cfg_
 
 
 # =========================
-# PYPPETEER RENDER (write straight to ZIP + return count)
+# PYPPETEER RENDER
 # =========================
-async def render_html_list_to_zip(html_list, zip_file, progress_cb=None,
-                                 dsf: float = 1.8, auto_fit: bool = True,
-                                 min_w: int = 980, max_w: int = 3500, wait_ms: int = 60):
-    """
-    Render từng HTML -> PNG và ghi trực tiếp vào zip_file.
-    Return: số file đã ghi ZIP.
-    """
+async def render_html_list_to_zip(
+    html_list,
+    zip_file,
+    progress_cb=None,
+    dsf: float = 1.8,
+    auto_fit: bool = True,
+    min_w: int = 980,
+    max_w: int = 3500,
+    wait_ms: int = 60,
+):
     from pyppeteer import launch
 
     browser = await launch(
@@ -367,7 +430,7 @@ async def render_html_list_to_zip(html_list, zip_file, progress_cb=None,
     exported = 0
     try:
         page = await browser.newPage()
-        await page.setViewport({"width": min_w, "height": 900, "deviceScaleFactor": float(dsf)})
+        await page.setViewport({"width": int(min_w), "height": 900, "deviceScaleFactor": float(dsf)})
 
         total = len(html_list)
         for i, (fname, html_str) in enumerate(html_list, start=1):
@@ -379,7 +442,7 @@ async def render_html_list_to_zip(html_list, zip_file, progress_cb=None,
             if wait_ms > 0:
                 try:
                     await page.waitFor(int(wait_ms))
-                except:
+                except Exception:
                     pass
 
             if auto_fit:
@@ -390,7 +453,7 @@ async def render_html_list_to_zip(html_list, zip_file, progress_cb=None,
                     w = int(dims.get("w", min_w))
                     w = max(int(min_w), min(int(max_w), w + 6))
                     await page.setViewport({"width": w, "height": 900, "deviceScaleFactor": float(dsf)})
-                except:
+                except Exception:
                     pass
 
             png_bytes = await page.screenshot({"fullPage": True, "type": "png"})
@@ -403,7 +466,7 @@ async def render_html_list_to_zip(html_list, zip_file, progress_cb=None,
     finally:
         try:
             await browser.close()
-        except:
+        except Exception:
             pass
 
     return exported
@@ -416,12 +479,12 @@ def run_async(coro):
     finally:
         try:
             loop.close()
-        except:
+        except Exception:
             pass
 
 
 # =========================
-# UI: Upload + cache workbook in session_state (giảm load lại khi tick checkbox)
+# UI: Upload + cache workbook
 # =========================
 uploaded = st.file_uploader("Chọn file Excel đã tổng hợp (.xlsx)", type=["xlsx"])
 if not uploaded:
@@ -436,7 +499,6 @@ if st.session_state.get("file_md5") != file_md5:
     st.session_state.wb = load_workbook(BytesIO(file_bytes), data_only=True)
     st.session_state.all_headers = None
     st.session_state.selected_headers = None
-    # clear checkbox states (tránh lệch key)
     for k in list(st.session_state.keys()):
         if isinstance(k, str) and k.startswith("hdr__"):
             del st.session_state[k]
@@ -445,10 +507,9 @@ wb = st.session_state.wb
 
 
 # =========================
-# UI: Column selection (NO auto render)
+# UI: Column selection
 # =========================
 def hdr_key(h: str) -> str:
-    # key ổn định theo tên cột
     hx = hashlib.md5(h.encode("utf-8")).hexdigest()[:10]
     return f"hdr__{hx}"
 
@@ -462,8 +523,7 @@ if st.session_state.get("all_headers") is None:
         headers = [normalize_header(x) for x in list(first_row[0])]
         headers = [h for h in headers if h != ""]
         all_headers.extend(headers)
-    all_headers = unique_preserve_order(all_headers)
-    st.session_state.all_headers = all_headers
+    st.session_state.all_headers = unique_preserve_order(all_headers)
 
 if st.session_state.get("selected_headers") is None:
     st.session_state.selected_headers = set(st.session_state.all_headers)
@@ -492,7 +552,6 @@ with colB:
 search = colC.text_input("🔎 Tìm cột", value="", placeholder="Ví dụ: lương, vào, ra, tăng ca...").strip().lower()
 filtered_headers = [h for h in all_headers if (search in h.lower())] if search else all_headers
 
-# render checkboxes grid
 grid_cols = st.columns(4)
 selected = set(st.session_state.selected_headers)
 
@@ -500,11 +559,8 @@ for i, h in enumerate(filtered_headers):
     key = hdr_key(h)
     if key not in st.session_state:
         st.session_state[key] = (h in selected)
+    grid_cols[i % 4].checkbox(h, key=key)
 
-    col = grid_cols[i % 4]
-    col.checkbox(h, key=key)
-
-# sync selected_headers
 selected_headers = set()
 for h in all_headers:
     if st.session_state.get(hdr_key(h), False):
@@ -530,7 +586,7 @@ if not selected_headers:
 
 
 # =========================
-# PROCESS SHEETS -> HTML LIST
+# PREPARE HTML LIST
 # =========================
 progress = st.progress(0.0)
 status = st.empty()
@@ -567,14 +623,12 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
         progress.progress(idx_sheet / max(total_sheets, 1))
         continue
 
-    # pad rows
     for r in range(len(data)):
         if len(data[r]) < max_cols:
             data[r].extend([None] * (max_cols - len(data[r])))
         if len(hl[r]) < max_cols:
             hl[r].extend([False] * (max_cols - len(hl[r])))
 
-    # keep columns that have any data in body (rows 2..n)
     keep_cols = []
     for j in range(max_cols):
         if any(not is_empty_value(data[i][j]) for i in range(1, len(data))):
@@ -587,7 +641,6 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
 
     headers_full = [normalize_header(data[0][j]) for j in keep_cols]
 
-    # filter theo checkbox (theo TÊN CỘT)
     keep_cols2 = []
     headers2 = []
     for j, hname in zip(keep_cols, headers_full):
@@ -603,7 +656,6 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
     body_rows_raw = [[data[i][j] for j in keep_cols2] for i in range(1, len(data))]
     hl_rows = [[hl[i][j] for j in keep_cols2] for i in range(1, len(hl))]
 
-    # tìm index cột 100% + 130% trong headers2 (sau khi lọc)
     col_100 = None
     col_130 = None
     for i, h in enumerate(headers2):
@@ -620,18 +672,14 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
     for r_idx, row in enumerate(body_rows_raw):
         is_total = is_total_row(row)
 
-        # STT
         stt_val = ""
         if add_stt and (not is_total):
             stt_counter += 1
             stt_val = str(stt_counter)
 
-        low_bg_cols = set()    # tô nền + đỏ (100% + 130%)
-        low_text_cols = set()  # chỉ chữ đỏ (chỉ 100%)
+        low_bg_cols = set()
+        low_text_cols = set()
 
-        # logic tô đỏ của bạn:
-        # - nếu có cả 100% và 130%: ô nào có dữ liệu, nếu (100+130) < threshold => tô đỏ cả 2 ô
-        # - nếu chỉ có 100%: nếu ô 100% có dữ liệu và < threshold => chữ đỏ + đậm ô 100%
         if (not is_total) and (col_100 is not None) and (col_130 is not None):
             raw100 = row[col_100]
             raw130 = row[col_130]
@@ -645,8 +693,7 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
 
         elif (not is_total) and (col_100 is not None) and (col_130 is None):
             raw100 = row[col_100]
-            has_data = not is_empty_value(raw100)
-            if has_data:
+            if not is_empty_value(raw100):
                 v100 = parse_float(raw100)
                 if v100 < float(threshold_hours):
                     low_text_cols.add(col_100)
@@ -664,7 +711,6 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
         for c_idx, val in enumerate(row):
             formatted = format_cell(val, headers2[c_idx])
             highlight = bool(hl_rows[r_idx][c_idx]) if r_idx < len(hl_rows) and c_idx < len(hl_rows[r_idx]) else False
-
             cells.append({
                 "value_html": html.escape(formatted),
                 "highlight": highlight,
@@ -674,7 +720,6 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
 
         rows_for_html.append({"is_total": is_total, "cells": cells})
 
-    # stamp text theo UI
     fname = safe_sheet_filename(sheet_name) + ".png"
     if stamp_mode == "Tên sheet":
         stamp_text = safe_sheet_filename(sheet_name)
@@ -696,7 +741,6 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
 
     to_render.append((fname, html_doc))
     prepared += 1
-
     progress.progress(idx_sheet / max(total_sheets, 1))
 
 status.info("Đang xuất file ảnh (Chromium)...")
@@ -707,22 +751,35 @@ if not to_render:
 
 
 # =========================
-# RENDER + ZIP (progress + count) + FIX download_button
+# RENDER + ZIP + RAM + COUNT
 # =========================
 render_bar = st.progress(0.0)
 render_text = st.empty()
 
 def progress_cb(done, total, current_name):
+    global _mem_peak_mb
+
     done = max(0, min(done, total))
     pct = 0.0 if total == 0 else done / total
+
     render_bar.progress(pct)
     render_text.info(f"Render {done}/{total}: **{current_name}**")
 
-zip_buf = BytesIO()
+    # update RAM theo nhịp (đỡ tốn thời gian)
+    if (done == 0) or (done == total) or (done % 3 == 0):
+        cur_mb, peak_mb, sys_used_pct, sys_avail_mb, sys_total_mb = _read_ram()
+        if cur_mb is not None:
+            _mem_peak_mb = max(_mem_peak_mb, cur_mb)
+        if peak_mb is not None:
+            _mem_peak_mb = max(_mem_peak_mb, peak_mb)
+        _render_mem_ui(cur_mb, _mem_peak_mb, sys_used_pct, sys_avail_mb, sys_total_mb)
+
+# ZIP tối ưu RAM: dùng spooled file (nhỏ thì ở RAM, lớn sẽ tự đổ ra disk)
+spool = SpooledTemporaryFile(max_size=64 * 1024 * 1024)  # 64MB
 exported_count = 0
 
 try:
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(spool, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         exported_count = run_async(
             render_html_list_to_zip(
                 to_render,
@@ -738,20 +795,16 @@ try:
 except Exception as e:
     st.error(
         "Lỗi render Chromium.\n\n"
-        f"Chi tiết: {e}\n\n"
-        "Nếu browser crash:\n"
-        "- Đảm bảo requirements.txt có pyppeteer==1.0.2\n"
-        "- packages.txt đủ libs (libnss3, libgtk-3-0, fonts...)\n"
-        "- Trên Streamlit Cloud bấm Reboot app để rebuild môi trường"
+        f"Chi tiết: {e}"
     )
     st.stop()
 
 render_bar.empty()
 render_text.empty()
 
-# ✅ FIX LỖI 'Invalid binary data format'
-zip_buf.seek(0)
-zip_bytes = zip_buf.getvalue()  # bytes (Streamlit download_button chắc chắn nhận)
+# đọc bytes zip để download
+spool.seek(0)
+zip_bytes = spool.read()
 zip_mb = len(zip_bytes) / (1024 * 1024)
 
 status.success(
