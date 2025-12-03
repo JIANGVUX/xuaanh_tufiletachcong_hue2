@@ -720,13 +720,17 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
 
         rows_for_html.append({"is_total": is_total, "cells": cells})
 
-    fname = safe_sheet_filename(sheet_name) + ".png"
+    base_name = safe_sheet_filename(sheet_name)
+    numbered_name = f"{prepared + 1}_{base_name}.png"
+    fname = numbered_name
+
     if stamp_mode == "Tên sheet":
-        stamp_text = safe_sheet_filename(sheet_name)
+        stamp_text = base_name
     elif stamp_mode == "Tên file ảnh":
-        stamp_text = fname
+        stamp_text = fname  # dùng tên đã đánh số
     else:
         stamp_text = (stamp_custom or "").strip()
+
 
     html_doc = build_html(
         sheet_name=sheet_name,
