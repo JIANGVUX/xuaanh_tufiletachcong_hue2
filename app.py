@@ -37,12 +37,12 @@ os.environ.setdefault("PYPPETEER_HOME", str(Path.home() / ".cache" / "pyppeteer"
 DEFAULT_WATERMARK = "Liên hệ Nguyễn Huệ Hr ( 0356 227 868 ) - timvieclam.9phut.com"
 DEFAULT_THRESHOLD = 8.0
 
-DEFAULT_RENAME_RULES = """Lương giờ 100% = Lương ca ngày
-Lương giờ 130% = Lương ca đêm
+DEFAULT_RENAME_RULES = """Lương giờ 100% = Lương giờ ca ngày
+Lương giờ 130% = Lương giờ ca đêm
 TC 150% = T/ca ngày
 TC 200% = T/ca Đêm
-TC ngày CN 200% = T/ca ngày CN
-TC đêm CN 270% = T/Ca đêm CN
+TC ngày CN 200% = T/ca giờ ngày CN
+TC đêm CN 270% = T/Ca giờ đêm CN
 """
 
 
