@@ -37,14 +37,6 @@ os.environ.setdefault("PYPPETEER_HOME", str(Path.home() / ".cache" / "pyppeteer"
 DEFAULT_WATERMARK = "Liên hệ Nguyễn Huệ Hr ( 0356 227 868 ) - timvieclam.9phut.com"
 DEFAULT_THRESHOLD = 8.0
 
-DEFAULT_RENAME_RULES = """Lương giờ 100% = Lương ca ngày
-Lương giờ 130% = Lương ca đêm
-TC 150% = T/ca ngày
-TC 200% = T/ca Đêm
-TC ngày CN 200% = T/ca ngày CN
-TC đêm CN 270% = T/Ca đêm CN
-"""
-
 
 # =========================
 # UI: Sidebar config
@@ -82,16 +74,6 @@ stamp_custom = st.sidebar.text_input("Stamp tùy chỉnh", value="", disabled=(s
 stamp_size = st.sidebar.slider("Cỡ chữ Stamp", 10, 26, 16)
 
 st.sidebar.divider()
-st.sidebar.subheader("🧩 Đổi tên cột khi xuất ảnh")
-
-rename_enable = st.sidebar.checkbox("Bật đổi tên header khi xuất ảnh", value=True)
-rename_rules = st.sidebar.text_area(
-    "Nhập mapping dạng: Tên cũ = Tên mới (mỗi dòng 1 mapping)",
-    value=DEFAULT_RENAME_RULES,
-    height=160,
-    disabled=(not rename_enable),
-)
-
 st.sidebar.caption("Gợi ý: nếu thấy chậm, giảm deviceScaleFactor xuống 1.4–1.8 và giảm số cột giữ lại.")
 
 
@@ -365,55 +347,6 @@ def is_total_row(row_vals) -> bool:
         if str(v).strip().lower() in ("tổng", "tong"):
             return True
     return False
-
-def _norm_key(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def parse_rename_rules(text: str) -> dict:
-    """
-    Parse mapping lines:
-      A = B
-      A => B
-      A -> B
-    Return: dict normalized_old -> new_name (trimmed)
-    """
-    mp = {}
-    if not text:
-        return mp
-    for raw in str(text).splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("#") or line.startswith("//"):
-            continue
-
-        sep = None
-        if "=>" in line:
-            sep = "=>"
-        elif "->" in line:
-            sep = "->"
-        elif "=" in line:
-            sep = "="
-
-        if not sep:
-            continue
-
-        left, right = line.split(sep, 1)
-        old = left.strip()
-        new = right.strip()
-        if not old or not new:
-            continue
-        mp[_norm_key(old)] = new
-    return mp
-
-RENAME_MAP = parse_rename_rules(rename_rules) if rename_enable else {}
-
-def rename_header_for_output(h: str) -> str:
-    if not rename_enable or not RENAME_MAP:
-        return h
-    return RENAME_MAP.get(_norm_key(h), h)
 
 def build_html(sheet_name: str, headers: list, rows: list, stamp_text: str, cfg_css: str,
               watermark: str, show_wm: bool, show_st: bool) -> str:
@@ -723,7 +656,6 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
     body_rows_raw = [[data[i][j] for j in keep_cols2] for i in range(1, len(data))]
     hl_rows = [[hl[i][j] for j in keep_cols2] for i in range(1, len(hl))]
 
-    # Detect cột 100/130 dựa trên header GỐC (không bị rename)
     col_100 = None
     col_130 = None
     for i, h in enumerate(headers2):
@@ -732,9 +664,7 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
         if col_130 is None and is_col_130(h):
             col_130 = i
 
-    # Header hiển thị khi xuất ảnh: apply rename mapping
-    headers_display = [rename_header_for_output(h) for h in headers2]
-    headers_out = (["STT"] + headers_display) if add_stt else headers_display
+    headers_out = (["STT"] + headers2) if add_stt else headers2
 
     rows_for_html = []
     stt_counter = 0
@@ -779,7 +709,6 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
             })
 
         for c_idx, val in enumerate(row):
-            # Format theo header GỐC để đảm bảo nhận diện "giờ vào/ra", "ngày" không bị sai khi rename
             formatted = format_cell(val, headers2[c_idx])
             highlight = bool(hl_rows[r_idx][c_idx]) if r_idx < len(hl_rows) and c_idx < len(hl_rows[r_idx]) else False
             cells.append({
@@ -801,6 +730,7 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
         stamp_text = fname  # dùng tên đã đánh số
     else:
         stamp_text = (stamp_custom or "").strip()
+
 
     html_doc = build_html(
         sheet_name=sheet_name,
