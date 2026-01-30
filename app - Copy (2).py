@@ -879,7 +879,8 @@ for idx_sheet, sheet_name in enumerate(sheetnames, start=1):
 
     body_rows_raw = [[data[i][j] for j in keep_cols2] for i in range(1, len(data))]
     hl_rows = [[hl[i][j] for j in keep_cols2] for i in range(1, len(hl))]
-    fill_total_row_if_missing(body_rows_raw, hl_rows, headers2, force_overwrite=False)
+# ✅ FIX: tự tính và điền hàng TỔNG cho mọi cột số (ví dụ: T/ca ngày, T/ca đêm...)
+fill_total_row_if_missing(body_rows_raw, hl_rows, headers2, force_overwrite=False)
     # Detect cột 100/130 dựa trên header GỐC (không bị rename)
     col_100 = None
     col_130 = None
